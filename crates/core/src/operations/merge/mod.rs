@@ -50,7 +50,8 @@ use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, ScalarValue, TableReference};
 use datafusion_expr::{col, conditional_expressions::CaseBuilder, lit, when, Expr, JoinType};
 use datafusion_expr::{
-    Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode, UNNAMED_TABLE,
+    ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode,
+    UNNAMED_TABLE,
 };
 
 use filter::try_construct_early_filter;
@@ -59,11 +60,13 @@ use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 use serde::Serialize;
 use tracing::log::*;
+use uuid::Uuid;
 
 use self::barrier::{MergeBarrier, MergeBarrierExec};
 
 use super::datafusion_utils::{into_expr, maybe_into_expr, Expression};
 use super::transaction::{CommitProperties, PROTOCOL};
+use super::{CustomExecuteHandler, Operation};
 use crate::delta_datafusion::expr::{fmt_expr_to_sql, parse_predicate_expression};
 use crate::delta_datafusion::logical::MetricObserver;
 use crate::delta_datafusion::physical::{find_metric_node, get_metric, MetricObserverExec};
@@ -72,7 +75,7 @@ use crate::delta_datafusion::{
     register_store, DataFusionMixins, DeltaColumn, DeltaScan, DeltaScanConfigBuilder,
     DeltaSessionConfig, DeltaTableProvider,
 };
-use crate::kernel::Action;
+use crate::kernel::{Action, DataCheck, StructTypeExt};
 use crate::logstore::LogStoreRef;
 use crate::operations::cdc::*;
 use crate::operations::merge::barrier::find_node;
@@ -80,6 +83,7 @@ use crate::operations::transaction::CommitBuilder;
 use crate::operations::write::{write_execution_plan, write_execution_plan_cdc, WriterStatsConfig};
 use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::state::DeltaTableState;
+use crate::table::GeneratedColumn;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 
 mod barrier;
@@ -135,9 +139,17 @@ pub struct MergeBuilder {
     /// safe_cast determines how data types that do not match the underlying table are handled
     /// By default an error is returned
     safe_cast: bool,
+    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
-impl super::Operation<()> for MergeBuilder {}
+impl super::Operation<()> for MergeBuilder {
+    fn log_store(&self) -> &LogStoreRef {
+        &self.log_store
+    }
+    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>> {
+        self.custom_execute_handler.clone()
+    }
+}
 
 impl MergeBuilder {
     /// Create a new [`MergeBuilder`]
@@ -162,6 +174,7 @@ impl MergeBuilder {
             not_match_operations: Vec::new(),
             not_match_source_operations: Vec::new(),
             safe_cast: false,
+            custom_execute_handler: None,
         }
     }
 
@@ -379,6 +392,12 @@ impl MergeBuilder {
     /// Test123     ->      null
     pub fn with_safe_cast(mut self, safe_cast: bool) -> Self {
         self.safe_cast = safe_cast;
+        self
+    }
+
+    /// Set a custom execute handler, for pre and post execution
+    pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
+        self.custom_execute_handler = Some(handler);
         self
     }
 }
@@ -689,11 +708,9 @@ async fn execute(
     match_operations: Vec<MergeOperationConfig>,
     not_match_target_operations: Vec<MergeOperationConfig>,
     not_match_source_operations: Vec<MergeOperationConfig>,
+    operation_id: Uuid,
+    handle: Option<&Arc<dyn CustomExecuteHandler>>,
 ) -> DeltaResult<(DeltaTableState, MergeMetrics)> {
-    if !snapshot.load_config().require_files {
-        return Err(DeltaTableError::NotInitializedWithFiles("MERGE".into()));
-    }
-
     let mut metrics = MergeMetrics::default();
     let exec_start = Instant::now();
     // Determining whether we should write change data once so that computation of change data can
@@ -735,6 +752,79 @@ async fn execute(
         None => TableReference::bare(UNNAMED_TABLE),
     };
 
+    /// Add generated column expressions to a dataframe
+    fn add_missing_generated_columns(
+        mut df: DataFrame,
+        generated_cols: &Vec<GeneratedColumn>,
+    ) -> DeltaResult<(DataFrame, Vec<String>)> {
+        let mut missing_cols = vec![];
+        for generated_col in generated_cols {
+            let col_name = generated_col.get_name();
+
+            if df
+                .clone()
+                .schema()
+                .field_with_unqualified_name(col_name)
+                .is_err()
+            // implies it doesn't exist
+            {
+                debug!(
+                    "Adding missing generated column {} in source as placeholder",
+                    col_name
+                );
+                // If column doesn't exist, we add a null column, later we will generate the values after
+                // all the merge is projected.
+                // Other generated columns that were provided upon the start we only validate during write
+                missing_cols.push(col_name.to_string());
+                df = df
+                    .clone()
+                    .with_column(col_name, Expr::Literal(ScalarValue::Null))?;
+            }
+        }
+        Ok((df, missing_cols))
+    }
+
+    /// Add generated column expressions to a dataframe
+    fn add_generated_columns(
+        mut df: DataFrame,
+        generated_cols: &Vec<GeneratedColumn>,
+        generated_cols_missing_in_source: &Vec<String>,
+        state: &SessionState,
+    ) -> DeltaResult<DataFrame> {
+        debug!("Generating columns in dataframe");
+        for generated_col in generated_cols {
+            // We only validate columns that were missing from the start. We don't update
+            // update generated columns that were provided during runtime
+            if !generated_cols_missing_in_source.contains(&generated_col.name) {
+                continue;
+            }
+
+            let generation_expr = state.create_logical_expr(
+                generated_col.get_generation_expression(),
+                df.clone().schema(),
+            )?;
+            let col_name = generated_col.get_name();
+
+            df = df.clone().with_column(
+                generated_col.get_name(),
+                when(col(col_name).is_null(), generation_expr)
+                    .otherwise(col(col_name))?
+                    .cast_to(
+                        &arrow_schema::DataType::try_from(&generated_col.data_type)?,
+                        df.schema(),
+                    )?,
+            )?
+        }
+        Ok(df)
+    }
+
+    let generated_col_expressions = snapshot
+        .schema()
+        .get_generated_columns()
+        .unwrap_or_default();
+
+    let (source, missing_generated_columns) =
+        add_missing_generated_columns(source, &generated_col_expressions)?;
     // This is only done to provide the source columns with a correct table reference. Just renaming the columns does not work
     let source = LogicalPlanBuilder::scan(
         source_name.clone(),
@@ -1105,12 +1195,12 @@ async fn execute(
         LogicalPlanBuilder::from(plan).project(fields)?.build()?
     };
 
-    let distrbute_expr = col(file_column.as_str());
+    let distribute_expr = col(file_column.as_str());
 
     let merge_barrier = LogicalPlan::Extension(Extension {
         node: Arc::new(MergeBarrier {
             input: new_columns.clone(),
-            expr: distrbute_expr,
+            expr: distribute_expr,
             file_column,
         }),
     });
@@ -1145,26 +1235,40 @@ async fn execute(
             lit(5),
         ))?;
 
-        change_data.push(
-            cdc_projection
-                .clone()
-                .filter(
-                    col(SOURCE_COLUMN)
-                        .is_true()
-                        .and(col(TARGET_COLUMN).is_null()),
-                )?
-                .select(write_projection.clone())?
-                .with_column(CDC_COLUMN_NAME, lit("insert"))?,
-        );
+        let mut cdc_insert_df = cdc_projection
+            .clone()
+            .filter(
+                col(SOURCE_COLUMN)
+                    .is_true()
+                    .and(col(TARGET_COLUMN).is_null()),
+            )?
+            .select(write_projection.clone())?
+            .with_column(CDC_COLUMN_NAME, lit("insert"))?;
 
-        let after = cdc_projection
+        cdc_insert_df = add_generated_columns(
+            cdc_insert_df,
+            &generated_col_expressions,
+            &missing_generated_columns,
+            &state,
+        )?;
+
+        change_data.push(cdc_insert_df);
+
+        let mut after = cdc_projection
             .clone()
             .filter(col(TARGET_COLUMN).is_true())?
             .select(write_projection.clone())?;
 
+        after = add_generated_columns(
+            after,
+            &generated_col_expressions,
+            &missing_generated_columns,
+            &state,
+        )?;
+
         // Extra select_columns is required so that before and after have same schema order
         // DataFusion doesn't have UnionByName yet, see https://github.com/apache/datafusion/issues/12650
-        let before = cdc_projection
+        let mut before = cdc_projection
             .clone()
             .filter(col(crate::delta_datafusion::PATH_COLUMN).is_not_null())?
             .select(
@@ -1184,11 +1288,24 @@ async fn execute(
                     .collect::<Vec<_>>(),
             )?;
 
+        before = add_generated_columns(
+            before,
+            &generated_col_expressions,
+            &missing_generated_columns,
+            &state,
+        )?;
+
         let tracker = CDCTracker::new(before, after);
         change_data.push(tracker.collect()?);
     }
 
-    let project = filtered.clone().select(write_projection)?;
+    let mut project = filtered.clone().select(write_projection)?;
+    project = add_generated_columns(
+        project,
+        &generated_col_expressions,
+        &missing_generated_columns,
+        &state,
+    )?;
 
     let merge_final = &project.into_unoptimized_plan();
     let write = state.create_physical_plan(merge_final).await?;
@@ -1215,7 +1332,7 @@ async fn execute(
         state.clone(),
         write,
         table_partition_cols.clone(),
-        log_store.object_store(),
+        log_store.object_store(Some(operation_id)),
         Some(snapshot.table_config().target_file_size() as usize),
         None,
         writer_properties.clone(),
@@ -1239,7 +1356,7 @@ async fn execute(
                 state.clone(),
                 df.create_physical_plan().await?,
                 table_partition_cols.clone(),
-                log_store.object_store(),
+                log_store.object_store(Some(operation_id)),
                 Some(snapshot.table_config().target_file_size() as usize),
                 None,
                 writer_properties,
@@ -1320,6 +1437,8 @@ async fn execute(
 
     let commit = CommitBuilder::from(commit_properties)
         .with_actions(actions)
+        .with_operation_id(operation_id)
+        .with_post_commit_hook_handler(handle.cloned())
         .build(Some(&snapshot), log_store.clone(), operation)
         .await?;
     Ok((commit.snapshot(), metrics))
@@ -1351,6 +1470,13 @@ impl std::future::IntoFuture for MergeBuilder {
         Box::pin(async move {
             PROTOCOL.can_write_to(&this.snapshot.snapshot)?;
 
+            if !this.snapshot.load_config().require_files {
+                return Err(DeltaTableError::NotInitializedWithFiles("MERGE".into()));
+            }
+
+            let operation_id = this.get_operation_id();
+            this.pre_execute(operation_id).await?;
+
             let state = this.state.unwrap_or_else(|| {
                 let config: SessionConfig = DeltaSessionConfig::default().into();
                 let session = SessionContext::new_with_config(config);
@@ -1375,8 +1501,14 @@ impl std::future::IntoFuture for MergeBuilder {
                 this.match_operations,
                 this.not_match_operations,
                 this.not_match_source_operations,
+                operation_id,
+                this.custom_execute_handler.as_ref(),
             )
             .await?;
+
+            if let Some(handler) = this.custom_execute_handler {
+                handler.post_execute(&this.log_store, operation_id).await?;
+            }
 
             Ok((
                 DeltaTable::new_with_state(this.log_store, snapshot),

@@ -75,11 +75,9 @@ pub enum UnityCatalogError {
 
 impl From<UnityCatalogError> for DataCatalogError {
     fn from(value: UnityCatalogError) -> Self {
-        match value {
-            _ => DataCatalogError::Generic {
-                catalog: "Unity",
-                source: Box::new(value),
-            },
+        DataCatalogError::Generic {
+            catalog: "Unity",
+            source: Box::new(value),
         }
     }
 }
@@ -644,8 +642,7 @@ impl DataCatalog for UnityCatalog {
             GetTableResponse::Error(err) => Err(UnityCatalogError::InvalidTable {
                 error_code: err.error_code,
                 message: err.message,
-            }
-            .into()),
+            }),
         }
     }
 }

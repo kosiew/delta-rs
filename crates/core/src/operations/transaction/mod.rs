@@ -1,9 +1,9 @@
 //! Add a commit entry to the Delta Table.
 //! This module provides a unified interface for modifying commit behavior and attributes
 //!
-//! [`CommitProperties`] provides an unified client interface for all Delta opeartions.
+//! [`CommitProperties`] provides an unified client interface for all Delta operations.
 //! Internally this is used to initialize a [`CommitBuilder`].
-//!  
+//!
 //! For advanced use cases [`CommitBuilder`] can be used which allows
 //! finer control over the commit process. The builder can be converted
 //! into a future the yield either a [`PreparedCommit`] or a [`FinalizedCommit`].
@@ -14,66 +14,67 @@
 //!
 //!<pre>
 //!                                          Client Interface
-//!        ┌─────────────────────────────┐                    
-//!        │      Commit Properties      │                    
-//!        │                             │                    
-//!        │ Public commit interface for │                    
-//!        │     all Delta Operations    │                    
-//!        │                             │                    
-//!        └─────────────┬───────────────┘                    
-//!                      │                                    
+//!        ┌─────────────────────────────┐
+//!        │      Commit Properties      │
+//!        │                             │
+//!        │ Public commit interface for │
+//!        │     all Delta Operations    │
+//!        │                             │
+//!        └─────────────┬───────────────┘
+//!                      │
 //! ─────────────────────┼────────────────────────────────────
-//!                      │                                    
+//!                      │
 //!                      ▼                  Advanced Interface
-//!        ┌─────────────────────────────┐                    
-//!        │       Commit Builder        │                    
-//!        │                             │                    
-//!        │   Advanced entry point for  │                    
-//!        │     creating a commit       │                    
-//!        └─────────────┬───────────────┘                    
-//!                      │                                    
-//!                      ▼                                    
-//!     ┌───────────────────────────────────┐                 
-//!     │                                   │                 
-//!     │ ┌───────────────────────────────┐ │                 
-//!     │ │        Prepared Commit        │ │                 
-//!     │ │                               │ │                 
-//!     │ │     Represents a temporary    │ │                 
-//!     │ │   commit marker written to    │ │                 
-//!     │ │           storage             │ │                 
-//!     │ └──────────────┬────────────────┘ │                 
-//!     │                │                  │                 
-//!     │                ▼                  │                 
-//!     │ ┌───────────────────────────────┐ │                 
-//!     │ │       Finalize Commit         │ │                 
-//!     │ │                               │ │                 
-//!     │ │   Convert the commit marker   │ │                 
-//!     │ │   to a commit using atomic    │ │                 
-//!     │ │         operations            │ │                 
-//!     │ │                               │ │                 
-//!     │ └───────────────────────────────┘ │                 
-//!     │                                   │                 
-//!     └────────────────┬──────────────────┘                 
-//!                      │                                    
-//!                      ▼                                    
-//!       ┌───────────────────────────────┐                   
-//!       │          Post Commit          │                   
-//!       │                               │                   
-//!       │ Commit that was materialized  │                   
-//!       │ to storage with post commit   │                   
-//!       │      hooks to be executed     │                   
-//!       └──────────────┬────────────────┘                 
-//!                      │                                    
-//!                      ▼    
-//!       ┌───────────────────────────────┐                   
-//!       │        Finalized Commit       │                   
-//!       │                               │                   
-//!       │ Commit that was materialized  │                   
-//!       │         to storage            │                   
-//!       │                               │                   
-//!       └───────────────────────────────┘           
+//!        ┌─────────────────────────────┐
+//!        │       Commit Builder        │
+//!        │                             │
+//!        │   Advanced entry point for  │
+//!        │     creating a commit       │
+//!        └─────────────┬───────────────┘
+//!                      │
+//!                      ▼
+//!     ┌───────────────────────────────────┐
+//!     │                                   │
+//!     │ ┌───────────────────────────────┐ │
+//!     │ │        Prepared Commit        │ │
+//!     │ │                               │ │
+//!     │ │     Represents a temporary    │ │
+//!     │ │   commit marker written to    │ │
+//!     │ │           storage             │ │
+//!     │ └──────────────┬────────────────┘ │
+//!     │                │                  │
+//!     │                ▼                  │
+//!     │ ┌───────────────────────────────┐ │
+//!     │ │       Finalize Commit         │ │
+//!     │ │                               │ │
+//!     │ │   Convert the commit marker   │ │
+//!     │ │   to a commit using atomic    │ │
+//!     │ │         operations            │ │
+//!     │ │                               │ │
+//!     │ └───────────────────────────────┘ │
+//!     │                                   │
+//!     └────────────────┬──────────────────┘
+//!                      │
+//!                      ▼
+//!       ┌───────────────────────────────┐
+//!       │          Post Commit          │
+//!       │                               │
+//!       │ Commit that was materialized  │
+//!       │ to storage with post commit   │
+//!       │      hooks to be executed     │
+//!       └──────────────┬────────────────┘
+//!                      │
+//!                      ▼
+//!       ┌───────────────────────────────┐
+//!       │        Finalized Commit       │
+//!       │                               │
+//!       │ Commit that was materialized  │
+//!       │         to storage            │
+//!       │                               │
+//!       └───────────────────────────────┘
 //!</pre>
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -83,23 +84,24 @@ use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
 use serde_json::Value;
 use tracing::*;
+use uuid::Uuid;
 
 use self::conflict_checker::{TransactionInfo, WinningCommitSummary};
 use crate::checkpoints::{cleanup_expired_logs_for, create_checkpoint_for};
 use crate::errors::DeltaTableError;
-use crate::kernel::{
-    Action, CommitInfo, EagerSnapshot, Metadata, Protocol, ReaderFeatures, Transaction,
-    WriterFeatures,
-};
+use crate::kernel::{Action, CommitInfo, EagerSnapshot, Metadata, Protocol, Transaction};
 use crate::logstore::{CommitOrBytes, LogStoreRef};
 use crate::protocol::DeltaOperation;
 use crate::storage::ObjectStoreRef;
 use crate::table::config::TableConfig;
 use crate::table::state::DeltaTableState;
 use crate::{crate_version, DeltaResult};
+use delta_kernel::table_features::{ReaderFeatures, WriterFeatures};
 
 pub use self::conflict_checker::CommitConflictError;
 pub use self::protocol::INSTANCE as PROTOCOL;
+
+use super::CustomExecuteHandler;
 
 #[cfg(test)]
 pub(crate) mod application;
@@ -133,7 +135,7 @@ pub enum TransactionError {
         source: ObjectStoreError,
     },
 
-    /// Error returned when a commit conflict ocurred
+    /// Error returned when a commit conflict occurred
     #[error("Failed to commit transaction: {0}")]
     CommitConflict(#[from] CommitConflictError),
 
@@ -264,7 +266,7 @@ pub struct CommitData {
 }
 
 impl CommitData {
-    /// Create new data to be comitted
+    /// Create new data to be committed
     pub fn new(
         mut actions: Vec<Action>,
         operation: DeltaOperation,
@@ -317,7 +319,7 @@ pub struct PostCommitHookProperties {
 
 #[derive(Clone, Debug)]
 /// End user facing interface to be used by operations on the table.
-/// Enable controling commit behaviour and modifying metadata that is written during a commit.
+/// Enable controlling commit behaviour and modifying metadata that is written during a commit.
 pub struct CommitProperties {
     pub(crate) app_metadata: HashMap<String, Value>,
     pub(crate) app_transaction: Vec<Transaction>,
@@ -339,7 +341,7 @@ impl Default for CommitProperties {
 }
 
 impl CommitProperties {
-    /// Specify metadata the be comitted
+    /// Specify metadata the be committed
     pub fn with_metadata(
         mut self,
         metadata: impl IntoIterator<Item = (String, serde_json::Value)>,
@@ -360,7 +362,7 @@ impl CommitProperties {
         self
     }
 
-    /// Add an additonal application transaction to the commit
+    /// Add an additional application transaction to the commit
     pub fn with_application_transaction(mut self, txn: Transaction) -> Self {
         self.app_transaction.push(txn);
         self
@@ -401,6 +403,8 @@ pub struct CommitBuilder {
     app_transaction: Vec<Transaction>,
     max_retries: usize,
     post_commit_hook: Option<PostCommitHookProperties>,
+    post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
+    operation_id: Uuid,
 }
 
 impl Default for CommitBuilder {
@@ -411,6 +415,8 @@ impl Default for CommitBuilder {
             app_transaction: Vec::new(),
             max_retries: DEFAULT_RETRIES,
             post_commit_hook: None,
+            post_commit_hook_handler: None,
+            operation_id: Uuid::new_v4(),
         }
     }
 }
@@ -440,6 +446,21 @@ impl<'a> CommitBuilder {
         self
     }
 
+    /// Propagate operation id to log store
+    pub fn with_operation_id(mut self, operation_id: Uuid) -> Self {
+        self.operation_id = operation_id;
+        self
+    }
+
+    /// Set a custom execute handler, for pre and post execution
+    pub fn with_post_commit_hook_handler(
+        mut self,
+        handler: Option<Arc<dyn CustomExecuteHandler>>,
+    ) -> Self {
+        self.post_commit_hook_handler = handler;
+        self
+    }
+
     /// Prepare a Commit operation using the configured builder
     pub fn build(
         self,
@@ -459,6 +480,8 @@ impl<'a> CommitBuilder {
             max_retries: self.max_retries,
             data,
             post_commit_hook: self.post_commit_hook,
+            post_commit_hook_handler: self.post_commit_hook_handler,
+            operation_id: self.operation_id,
         }
     }
 }
@@ -470,6 +493,8 @@ pub struct PreCommit<'a> {
     data: CommitData,
     max_retries: usize,
     post_commit_hook: Option<PostCommitHookProperties>,
+    post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
+    operation_id: Uuid,
 }
 
 impl<'a> std::future::IntoFuture for PreCommit<'a> {
@@ -504,12 +529,18 @@ impl<'a> PreCommit<'a> {
             }
             let log_entry = this.data.get_bytes()?;
 
-            // With the DefaultLogStore, we just pass the bytes around, since we use conditionalPuts
+            // With the DefaultLogStore & LakeFSLogstore, we just pass the bytes around, since we use conditionalPuts
             // Other stores will use tmp_commits
-            let commit_or_bytes = if this.log_store.name() == "DefaultLogStore" {
+            let commit_or_bytes = if ["LakeFSLogStore", "DefaultLogStore"]
+                .contains(&this.log_store.name().as_str())
+            {
                 CommitOrBytes::LogBytes(log_entry)
             } else {
-                write_tmp_commit(log_entry, this.log_store.object_store()).await?
+                write_tmp_commit(
+                    log_entry,
+                    this.log_store.object_store(Some(this.operation_id)),
+                )
+                .await?
             };
 
             Ok(PreparedCommit {
@@ -519,6 +550,8 @@ impl<'a> PreCommit<'a> {
                 max_retries: this.max_retries,
                 data: this.data,
                 post_commit: this.post_commit_hook,
+                post_commit_hook_handler: this.post_commit_hook_handler,
+                operation_id: this.operation_id,
             })
         })
     }
@@ -532,6 +565,8 @@ pub struct PreparedCommit<'a> {
     table_data: Option<&'a dyn TableReference>,
     max_retries: usize,
     post_commit: Option<PostCommitHookProperties>,
+    post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
+    operation_id: Uuid,
 }
 
 impl PreparedCommit<'_> {
@@ -553,7 +588,7 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
 
             if this.table_data.is_none() {
                 this.log_store
-                    .write_commit_entry(0, commit_or_bytes.clone())
+                    .write_commit_entry(0, commit_or_bytes.clone(), this.operation_id)
                     .await?;
                 return Ok(PostCommit {
                     version: 0,
@@ -562,6 +597,7 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                     cleanup_expired_logs: None,
                     log_store: this.log_store,
                     table_data: this.table_data,
+                    custom_execute_handler: this.post_commit_hook_handler,
                 });
             }
 
@@ -613,7 +649,7 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
 
                 match this
                     .log_store
-                    .write_commit_entry(version, commit_or_bytes.clone())
+                    .write_commit_entry(version, commit_or_bytes.clone(), this.operation_id)
                     .await
                 {
                     Ok(()) => {
@@ -630,6 +666,7 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                                 .unwrap_or_default(),
                             log_store: this.log_store,
                             table_data: this.table_data,
+                            custom_execute_handler: this.post_commit_hook_handler,
                         });
                     }
                     Err(TransactionError::VersionAlreadyExists(version)) => {
@@ -640,7 +677,7 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                     }
                     Err(err) => {
                         this.log_store
-                            .abort_commit_entry(version, commit_or_bytes)
+                            .abort_commit_entry(version, commit_or_bytes, this.operation_id)
                             .await?;
                         return Err(err.into());
                     }
@@ -656,18 +693,20 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
 pub struct PostCommit<'a> {
     /// The winning version number of the commit
     pub version: i64,
-    /// The data that was comitted to the log store
+    /// The data that was committed to the log store
     pub data: CommitData,
     create_checkpoint: bool,
     cleanup_expired_logs: Option<bool>,
     log_store: LogStoreRef,
     table_data: Option<&'a dyn TableReference>,
+    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
 impl PostCommit<'_> {
     /// Runs the post commit activities
     async fn run_post_commit_hook(&self) -> DeltaResult<DeltaTableState> {
         if let Some(table) = self.table_data {
+            let post_commit_operation_id = Uuid::new_v4();
             let mut snapshot = table.eager_snapshot().clone();
             if self.version - snapshot.version() > 1 {
                 // This may only occur during concurrent write actions. We need to update the state first to - 1
@@ -680,31 +719,61 @@ impl PostCommit<'_> {
                 snapshot.advance(vec![&self.data])?;
             }
             let state = DeltaTableState { snapshot };
-            // Execute each hook
-            if self.create_checkpoint {
-                self.create_checkpoint(&state, &self.log_store, self.version)
-                    .await?;
-            }
+
             let cleanup_logs = if let Some(cleanup_logs) = self.cleanup_expired_logs {
                 cleanup_logs
             } else {
                 state.table_config().enable_expired_log_cleanup()
             };
 
+            // Run arbitrary before_post_commit_hook code
+            if let Some(custom_execute_handler) = &self.custom_execute_handler {
+                custom_execute_handler
+                    .before_post_commit_hook(
+                        &self.log_store,
+                        cleanup_logs || self.create_checkpoint,
+                        post_commit_operation_id,
+                    )
+                    .await?
+            }
+
+            if self.create_checkpoint {
+                // Execute create checkpoint hook
+                self.create_checkpoint(
+                    &state,
+                    &self.log_store,
+                    self.version,
+                    post_commit_operation_id,
+                )
+                .await?;
+            }
             if cleanup_logs {
+                // Execute clean up logs hook
                 cleanup_expired_logs_for(
                     self.version,
                     self.log_store.as_ref(),
                     Utc::now().timestamp_millis()
                         - state.table_config().log_retention_duration().as_millis() as i64,
+                    Some(post_commit_operation_id),
                 )
                 .await?;
+            }
+
+            // Run arbitrary after_post_commit_hook code
+            if let Some(custom_execute_handler) = &self.custom_execute_handler {
+                custom_execute_handler
+                    .after_post_commit_hook(
+                        &self.log_store,
+                        cleanup_logs || self.create_checkpoint,
+                        post_commit_operation_id,
+                    )
+                    .await?
             }
             Ok(state)
         } else {
             let state = DeltaTableState::try_new(
                 &Path::default(),
-                self.log_store.object_store(),
+                self.log_store.object_store(None),
                 Default::default(),
                 Some(self.version),
             )
@@ -717,6 +786,7 @@ impl PostCommit<'_> {
         table_state: &DeltaTableState,
         log_store: &LogStoreRef,
         version: i64,
+        operation_id: Uuid,
     ) -> DeltaResult<()> {
         if !table_state.load_config().require_files {
             warn!("Checkpoint creation in post_commit_hook has been skipped due to table being initialized without files.");
@@ -725,7 +795,8 @@ impl PostCommit<'_> {
 
         let checkpoint_interval = table_state.config().checkpoint_interval() as i64;
         if ((version + 1) % checkpoint_interval) == 0 {
-            create_checkpoint_for(version, table_state, log_store.as_ref()).await?
+            create_checkpoint_for(version, table_state, log_store.as_ref(), Some(operation_id))
+                .await?
         }
         Ok(())
     }
@@ -733,7 +804,7 @@ impl PostCommit<'_> {
 
 /// A commit that successfully completed
 pub struct FinalizedCommit {
-    /// The new table state after a commmit
+    /// The new table state after a commit
     pub snapshot: DeltaTableState,
 
     /// Version of the finalized commit
@@ -741,7 +812,7 @@ pub struct FinalizedCommit {
 }
 
 impl FinalizedCommit {
-    /// The new table state after a commmit
+    /// The new table state after a commit
     pub fn snapshot(&self) -> DeltaTableState {
         self.snapshot.clone()
     }
@@ -805,14 +876,22 @@ mod tests {
         store.put(&version_path, PutPayload::new()).await.unwrap();
 
         let res = log_store
-            .write_commit_entry(0, CommitOrBytes::LogBytes(PutPayload::new().into()))
+            .write_commit_entry(
+                0,
+                CommitOrBytes::LogBytes(PutPayload::new().into()),
+                Uuid::new_v4(),
+            )
             .await;
         // fails if file version already exists
         assert!(res.is_err());
 
         // succeeds for next version
         log_store
-            .write_commit_entry(1, CommitOrBytes::LogBytes(PutPayload::new().into()))
+            .write_commit_entry(
+                1,
+                CommitOrBytes::LogBytes(PutPayload::new().into()),
+                Uuid::new_v4(),
+            )
             .await
             .unwrap();
     }

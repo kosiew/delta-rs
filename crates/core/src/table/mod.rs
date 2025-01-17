@@ -157,6 +157,46 @@ impl DataCheck for Constraint {
     }
 }
 
+/// A generated column
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub struct GeneratedColumn {
+    /// The full path to the field.
+    pub name: String,
+    /// The SQL string that generate the column value.
+    pub generation_expr: String,
+    /// The SQL string that must always evaluate to true.
+    pub validation_expr: String,
+    /// Data Type
+    pub data_type: DataType,
+}
+
+impl GeneratedColumn {
+    /// Create a new invariant
+    pub fn new(field_name: &str, sql_generation: &str, data_type: &DataType) -> Self {
+        Self {
+            name: field_name.to_string(),
+            generation_expr: sql_generation.to_string(),
+            validation_expr: format!("{field_name} = {sql_generation} OR ({field_name} IS NULL AND {sql_generation} IS NULL)"),
+            // validation_expr: format!("{} <=> {}", field_name, sql_generation), // update to 
+            data_type: data_type.clone()
+        }
+    }
+
+    pub fn get_generation_expression(&self) -> &str {
+        &self.generation_expr
+    }
+}
+
+impl DataCheck for GeneratedColumn {
+    fn get_name(&self) -> &str {
+        &self.name
+    }
+
+    fn get_expression(&self) -> &str {
+        &self.validation_expr
+    }
+}
+
 /// Return partition fields along with their data type from the current schema.
 pub(crate) fn get_partition_col_data_types<'a>(
     schema: &'a StructType,
@@ -279,7 +319,7 @@ impl DeltaTable {
 
     /// get a shared reference to the delta object store
     pub fn object_store(&self) -> ObjectStoreRef {
-        self.log_store.object_store()
+        self.log_store.object_store(None)
     }
 
     /// Check if the [`DeltaTable`] exists
@@ -346,7 +386,7 @@ impl DeltaTable {
             _ => {
                 let state = DeltaTableState::try_new(
                     &Path::default(),
-                    self.log_store.object_store(),
+                    self.log_store.object_store(None),
                     self.config.clone(),
                     max_version,
                 )
@@ -515,7 +555,7 @@ impl DeltaTable {
         let log_store = self.log_store();
         let prefix = Some(log_store.log_path());
         let offset_path = commit_uri_from_version(min_version);
-        let object_store = log_store.object_store();
+        let object_store = log_store.object_store(None);
         let mut files = object_store.list_with_offset(prefix, &offset_path);
 
         while let Some(obj_meta) = files.next().await {

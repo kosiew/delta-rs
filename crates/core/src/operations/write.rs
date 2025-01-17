@@ -35,7 +35,7 @@ use arrow_cast::can_cast_types;
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef as ArrowSchemaRef};
 use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
 use datafusion_common::DFSchema;
-use datafusion_expr::{lit, Expr};
+use datafusion_expr::{col, lit, when, Expr, ExprSchemable};
 use datafusion_physical_expr::expressions::{self};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::filter::FilterExec;
@@ -48,12 +48,13 @@ use object_store::prefix::PrefixStore;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use tracing::log::*;
+use uuid::Uuid;
 
 use super::cdc::should_write_cdc;
 use super::datafusion_utils::Expression;
 use super::transaction::{CommitBuilder, CommitProperties, TableReference, PROTOCOL};
 use super::writer::{DeltaWriter, WriterConfig};
-use super::CreateBuilder;
+use super::{CreateBuilder, CustomExecuteHandler, Operation};
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::delta_datafusion::expr::parse_predicate_expression;
 use crate::delta_datafusion::{
@@ -62,14 +63,15 @@ use crate::delta_datafusion::{
 use crate::delta_datafusion::{DataFusionMixins, DeltaDataChecker};
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::{
-    Action, ActionType, Add, AddCDCFile, Metadata, PartitionsExt, Remove, StructType,
+    Action, ActionType, Add, AddCDCFile, DataCheck, Metadata, PartitionsExt, Remove, StructType,
+    StructTypeExt,
 };
 use crate::logstore::LogStoreRef;
 use crate::operations::cast::{cast_record_batch, merge_schema::merge_arrow_schema};
 use crate::protocol::{DeltaOperation, SaveMode};
 use crate::storage::ObjectStoreRef;
 use crate::table::state::DeltaTableState;
-use crate::table::Constraint as DeltaConstraint;
+use crate::table::{Constraint as DeltaConstraint, GeneratedColumn};
 use crate::writer::record_batch::divide_by_partition_values;
 use crate::DeltaTable;
 
@@ -163,6 +165,7 @@ pub struct WriteBuilder {
     description: Option<String>,
     /// Configurations of the delta table, only used when table doesn't exist
     configuration: HashMap<String, Option<String>>,
+    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -180,7 +183,14 @@ pub struct WriteMetrics {
     pub execution_time_ms: u64,
 }
 
-impl super::Operation<()> for WriteBuilder {}
+impl super::Operation<()> for WriteBuilder {
+    fn log_store(&self) -> &LogStoreRef {
+        &self.log_store
+    }
+    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>> {
+        self.custom_execute_handler.clone()
+    }
+}
 
 impl WriteBuilder {
     /// Create a new [`WriteBuilder`]
@@ -203,6 +213,7 @@ impl WriteBuilder {
             name: None,
             description: None,
             configuration: Default::default(),
+            custom_execute_handler: None,
         }
     }
 
@@ -296,6 +307,12 @@ impl WriteBuilder {
         self
     }
 
+    /// Set a custom execute handler, for pre and post execution
+    pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
+        self.custom_execute_handler = Some(handler);
+        self
+    }
+
     /// Set configuration on created table
     pub fn with_configuration(
         mut self,
@@ -376,7 +393,7 @@ impl WriteBuilder {
                     builder = builder.with_comment(desc.clone());
                 };
 
-                let (_, actions, _) = builder.into_table_and_actions()?;
+                let (_, actions, _, _) = builder.into_table_and_actions().await?;
                 Ok(actions)
             }
         }
@@ -421,7 +438,11 @@ async fn write_execution_plan_with_predicate(
     let checker = if let Some(snapshot) = snapshot {
         DeltaDataChecker::new(snapshot)
     } else {
-        DeltaDataChecker::empty()
+        debug!("Using plan schema to derive generated columns, since no snapshot was provided. Implies first write.");
+        let delta_schema: StructType = schema.as_ref().try_into()?;
+        DeltaDataChecker::new_with_generated_columns(
+            delta_schema.get_generated_columns().unwrap_or_default(),
+        )
     };
     let checker = match predicate {
         Some(pred) => {
@@ -582,6 +603,7 @@ async fn execute_non_empty_expr(
     writer_stats_config: WriterStatsConfig,
     partition_scan: bool,
     insert_plan: Arc<dyn ExecutionPlan>,
+    operation_id: Uuid,
 ) -> DeltaResult<Vec<Action>> {
     // For each identified file perform a parquet scan + filter + limit (1) + count.
     // If returned count is not zero then append the file to be rewritten and removed from the log. Otherwise do nothing to the file.
@@ -619,7 +641,7 @@ async fn execute_non_empty_expr(
             state.clone(),
             filter,
             partition_columns.clone(),
-            log_store.object_store(),
+            log_store.object_store(Some(operation_id)),
             Some(snapshot.table_config().target_file_size() as usize),
             None,
             writer_properties.clone(),
@@ -647,6 +669,7 @@ async fn execute_non_empty_expr(
             writer_properties,
             writer_stats_config,
             insert_plan,
+            operation_id,
         )
         .await?
         {
@@ -669,6 +692,7 @@ pub(crate) async fn execute_non_empty_expr_cdc(
     writer_properties: Option<WriterProperties>,
     writer_stats_config: WriterStatsConfig,
     insert_plan: Arc<dyn ExecutionPlan>,
+    operation_id: Uuid,
 ) -> DeltaResult<Option<Vec<Action>>> {
     match should_write_cdc(snapshot) {
         // Create CDC scan
@@ -727,7 +751,7 @@ pub(crate) async fn execute_non_empty_expr_cdc(
                 state.clone(),
                 cdc_plan.clone(),
                 table_partition_cols.clone(),
-                log_store.object_store(),
+                log_store.object_store(Some(operation_id)),
                 Some(snapshot.table_config().target_file_size() as usize),
                 None,
                 writer_properties,
@@ -741,7 +765,7 @@ pub(crate) async fn execute_non_empty_expr_cdc(
     }
 }
 
-// This should only be called wth a valid predicate
+// This should only be called with a valid predicate
 #[allow(clippy::too_many_arguments)]
 async fn prepare_predicate_actions(
     predicate: Expr,
@@ -753,6 +777,7 @@ async fn prepare_predicate_actions(
     deletion_timestamp: i64,
     writer_stats_config: WriterStatsConfig,
     insert_plan: Arc<dyn ExecutionPlan>,
+    operation_id: Uuid,
 ) -> DeltaResult<Vec<Action>> {
     let candidates =
         find_files(snapshot, log_store.clone(), &state, Some(predicate.clone())).await?;
@@ -768,6 +793,7 @@ async fn prepare_predicate_actions(
         writer_stats_config,
         candidates.partition_scan,
         insert_plan,
+        operation_id,
     )
     .await?;
 
@@ -798,6 +824,10 @@ impl std::future::IntoFuture for WriteBuilder {
         let this = self;
 
         Box::pin(async move {
+            // Runs pre execution handler.
+            let operation_id = this.get_operation_id();
+            this.pre_execute(operation_id).await?;
+
             let mut metrics = WriteMetrics::default();
             let exec_start = Instant::now();
 
@@ -827,8 +857,14 @@ impl std::future::IntoFuture for WriteBuilder {
             } else {
                 Ok(this.partition_columns.unwrap_or_default())
             }?;
+
+            let generated_col_expressions = this
+                .snapshot
+                .as_ref()
+                .map(|v| v.schema().get_generated_columns().unwrap_or_default())
+                .unwrap_or_default();
             let mut schema_drift = false;
-            let plan = if let Some(plan) = this.input {
+            let mut plan = if let Some(plan) = this.input {
                 if this.schema_mode == Some(SchemaMode::Merge) {
                     return Err(DeltaTableError::Generic(
                         "Schema merge not supported yet for Datafusion".to_string(),
@@ -839,11 +875,22 @@ impl std::future::IntoFuture for WriteBuilder {
                 if batches.is_empty() {
                     Err(WriteError::MissingData)
                 } else {
-                    let schema = batches[0].schema();
+                    let mut schema = batches[0].schema();
 
+                    // Schema merging code should be aware of columns that can be generated during write
+                    // so they might be empty in the batch, but the will exist in the input_schema()
+                    // in this case we have to insert the generated column and it's type in the schema of the batch
                     let mut new_schema = None;
                     if let Some(snapshot) = &this.snapshot {
                         let table_schema = snapshot.input_schema()?;
+
+                        // Merge schema's initial round when there are generated columns expressions
+                        // This is to have the batch schema be the same as the input schema without adding new fields
+                        // from the incoming batch
+                        if !generated_col_expressions.is_empty() {
+                            schema = merge_arrow_schema(table_schema.clone(), schema, true)?;
+                        }
+
                         if let Err(schema_err) =
                             try_cast_batch(schema.fields(), table_schema.fields())
                         {
@@ -851,7 +898,11 @@ impl std::future::IntoFuture for WriteBuilder {
                             if this.mode == SaveMode::Overwrite
                                 && this.schema_mode == Some(SchemaMode::Overwrite)
                             {
-                                new_schema = None // we overwrite anyway, so no need to cast
+                                if generated_col_expressions.is_empty() {
+                                    new_schema = None // we overwrite anyway, so no need to cast
+                                } else {
+                                    new_schema = Some(schema.clone()) // we need to cast the batch to include the generated col as empty null
+                                }
                             } else if this.schema_mode == Some(SchemaMode::Merge) {
                                 new_schema = Some(merge_arrow_schema(
                                     table_schema.clone(),
@@ -864,7 +915,11 @@ impl std::future::IntoFuture for WriteBuilder {
                         } else if this.mode == SaveMode::Overwrite
                             && this.schema_mode == Some(SchemaMode::Overwrite)
                         {
-                            new_schema = None // we overwrite anyway, so no need to cast
+                            if generated_col_expressions.is_empty() {
+                                new_schema = None // we overwrite anyway, so no need to cast
+                            } else {
+                                new_schema = Some(schema.clone()) // we need to cast the batch to include the generated col as empty null
+                            }
                         } else {
                             // Schema needs to be merged so that utf8/binary/list types are preserved from the batch side if both table
                             // and batch contains such type. Other types are preserved from the table side.
@@ -887,7 +942,7 @@ impl std::future::IntoFuture for WriteBuilder {
                                     &batch,
                                     new_schema,
                                     this.safe_cast,
-                                    schema_drift, // Schema drifted so we have to add the missing columns/structfields.
+                                    schema_drift || !generated_col_expressions.is_empty(), // Schema drifted so we have to add the missing columns/structfields  or missing generated cols..
                                 )?,
                                 None => batch,
                             };
@@ -924,7 +979,7 @@ impl std::future::IntoFuture for WriteBuilder {
                                         &batch,
                                         new_schema.clone(),
                                         this.safe_cast,
-                                        schema_drift, // Schema drifted so we have to add the missing columns/structfields.
+                                        schema_drift || !generated_col_expressions.is_empty(), // Schema drifted so we have to add the missing columns/structfields or missing generated cols.
                                     )?);
                                     num_added_rows += batch.num_rows();
                                 }
@@ -947,40 +1002,25 @@ impl std::future::IntoFuture for WriteBuilder {
             } else {
                 Err(WriteError::MissingData)
             }?;
+
             let schema = plan.schema();
             if this.schema_mode == Some(SchemaMode::Merge) && schema_drift {
                 if let Some(snapshot) = &this.snapshot {
                     let schema_struct: StructType = schema.clone().try_into()?;
                     let current_protocol = snapshot.protocol();
                     let configuration = snapshot.metadata().configuration.clone();
-                    let maybe_new_protocol = if PROTOCOL
-                        .contains_timestampntz(schema_struct.fields())
-                        && !current_protocol
-                            .reader_features
-                            .clone()
-                            .unwrap_or_default()
-                            .contains(&crate::kernel::ReaderFeatures::TimestampWithoutTimezone)
-                    // We can check only reader features, as reader and writer timestampNtz
-                    // should be always enabled together
-                    {
-                        let new_protocol = current_protocol.clone().enable_timestamp_ntz();
-                        if !(current_protocol.min_reader_version == 3
-                            && current_protocol.min_writer_version == 7)
-                        {
-                            Some(new_protocol.move_table_properties_into_features(&configuration))
-                        } else {
-                            Some(new_protocol)
-                        }
-                    } else {
-                        None
-                    };
+                    let new_protocol = current_protocol
+                        .clone()
+                        .apply_column_metadata_to_protocol(&schema_struct)?
+                        .move_table_properties_into_features(&configuration);
+
                     let schema_action = Action::Metadata(Metadata::try_new(
                         schema_struct,
                         partition_columns.clone(),
                         configuration,
                     )?);
                     actions.push(schema_action);
-                    if let Some(new_protocol) = maybe_new_protocol {
+                    if current_protocol != &new_protocol {
                         actions.push(new_protocol.into())
                     }
                 }
@@ -992,6 +1032,59 @@ impl std::future::IntoFuture for WriteBuilder {
                     register_store(this.log_store.clone(), ctx.runtime_env());
                     ctx.state()
                 }
+            };
+
+            // Add when.then expr for generated columns
+            if !generated_col_expressions.is_empty() {
+                fn create_field(
+                    idx: usize,
+                    field: &arrow_schema::Field,
+                    generated_cols_map: &HashMap<String, GeneratedColumn>,
+                    state: &datafusion::execution::session_state::SessionState,
+                    dfschema: &DFSchema,
+                ) -> DeltaResult<(Arc<dyn PhysicalExpr>, String)> {
+                    match generated_cols_map.get(field.name()) {
+                        Some(generated_col) => {
+                            let generation_expr = state.create_physical_expr(
+                                when(
+                                    col(generated_col.get_name()).is_null(),
+                                    state.create_logical_expr(
+                                        generated_col.get_generation_expression(),
+                                        dfschema,
+                                    )?,
+                                )
+                                .otherwise(col(generated_col.get_name()))?
+                                .cast_to(
+                                    &arrow_schema::DataType::try_from(&generated_col.data_type)?,
+                                    dfschema,
+                                )?,
+                                dfschema,
+                            )?;
+                            Ok((generation_expr, field.name().to_owned()))
+                        }
+                        None => Ok((
+                            Arc::new(expressions::Column::new(field.name(), idx)),
+                            field.name().to_owned(),
+                        )),
+                    }
+                }
+
+                let dfschema: DFSchema = schema.as_ref().clone().try_into()?;
+                let generated_cols_map = generated_col_expressions
+                    .into_iter()
+                    .map(|v| (v.name.clone(), v))
+                    .collect::<HashMap<String, GeneratedColumn>>();
+                let current_fields: DeltaResult<Vec<(Arc<dyn PhysicalExpr>, String)>> = plan
+                    .schema()
+                    .fields()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, field)| {
+                        create_field(idx, field, &generated_cols_map, &state, &dfschema)
+                    })
+                    .collect();
+
+                plan = Arc::new(ProjectionExec::try_new(current_fields?, plan.clone())?);
             };
 
             let (predicate_str, predicate) = match this.predicate {
@@ -1032,7 +1125,7 @@ impl std::future::IntoFuture for WriteBuilder {
                 state.clone(),
                 plan.clone(),
                 partition_columns.clone(),
-                this.log_store.object_store().clone(),
+                this.log_store.object_store(Some(operation_id)).clone(),
                 target_file_size,
                 this.write_batch_size,
                 this.writer_properties.clone(),
@@ -1049,39 +1142,23 @@ impl std::future::IntoFuture for WriteBuilder {
                     // Update metadata with new schema
                     let table_schema = snapshot.input_schema()?;
 
-                    let configuration = snapshot.metadata().configuration.clone();
-                    let current_protocol = snapshot.protocol();
-                    let maybe_new_protocol = if PROTOCOL.contains_timestampntz(
-                        TryInto::<StructType>::try_into(schema.clone())?.fields(),
-                    ) && !current_protocol
-                        .reader_features
-                        .clone()
-                        .unwrap_or_default()
-                        .contains(&crate::kernel::ReaderFeatures::TimestampWithoutTimezone)
-                    // We can check only reader features, as reader and writer timestampNtz
-                    // should be always enabled together
-                    {
-                        let new_protocol = current_protocol.clone().enable_timestamp_ntz();
-                        if !(current_protocol.min_reader_version == 3
-                            && current_protocol.min_writer_version == 7)
-                        {
-                            Some(new_protocol.move_table_properties_into_features(&configuration))
-                        } else {
-                            Some(new_protocol)
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(protocol) = maybe_new_protocol {
-                        actions.push(protocol.into())
-                    }
-
+                    let delta_schema: StructType = schema.as_ref().try_into()?;
                     if schema != table_schema {
                         let mut metadata = snapshot.metadata().clone();
-                        let delta_schema: StructType = schema.as_ref().try_into()?;
+
                         metadata.schema_string = serde_json::to_string(&delta_schema)?;
                         actions.push(Action::Metadata(metadata));
+                    }
+
+                    let configuration = snapshot.metadata().configuration.clone();
+                    let current_protocol = snapshot.protocol();
+                    let new_protocol = current_protocol
+                        .clone()
+                        .apply_column_metadata_to_protocol(&delta_schema)?
+                        .move_table_properties_into_features(&configuration);
+
+                    if current_protocol != &new_protocol {
+                        actions.push(new_protocol.into())
                     }
 
                     let deletion_timestamp = SystemTime::now()
@@ -1101,6 +1178,7 @@ impl std::future::IntoFuture for WriteBuilder {
                                 deletion_timestamp,
                                 writer_stats_config,
                                 plan,
+                                operation_id,
                             )
                             .await?;
                             if !predicate_actions.is_empty() {
@@ -1143,12 +1221,18 @@ impl std::future::IntoFuture for WriteBuilder {
 
             let commit = CommitBuilder::from(commit_properties)
                 .with_actions(actions)
+                .with_post_commit_hook_handler(this.custom_execute_handler.clone())
+                .with_operation_id(operation_id)
                 .build(
                     this.snapshot.as_ref().map(|f| f as &dyn TableReference),
                     this.log_store.clone(),
                     operation.clone(),
                 )
                 .await?;
+
+            if let Some(handler) = this.custom_execute_handler {
+                handler.post_execute(&this.log_store, operation_id).await?;
+            }
 
             Ok(DeltaTable::new_with_state(this.log_store, commit.snapshot))
         })
@@ -1991,7 +2075,7 @@ mod tests {
         let table_logstore = table.log_store.clone();
         let table_state = table.state.clone().unwrap();
 
-        // An attempt to write records non comforming to predicate should fail
+        // An attempt to write records non conforming to predicate should fail
         let batch_fail = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
