@@ -17,7 +17,10 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-dependencies = ["pyarrow>=16"]
+dependencies = [
+    "polars>=1.20.0",
+    "pyarrow>=16",
+]
 
 [project.optional-dependencies]
 pandas = ["pandas"]
