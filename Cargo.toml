@@ -41,7 +41,7 @@ arrow-ord = { version = "53" }
 arrow-row = { version = "53" }
 arrow-schema = { version = "53" }
 arrow-select = { version = "53" }
-object_store = { version = "0.11.2" , features = ["cloud"]}
+object_store = { version = "0.11.2", features = ["cloud"] }
 parquet = { version = "53" }
 
 # datafusion
@@ -56,10 +56,11 @@ datafusion-physical-plan = { version = "44" }
 datafusion-proto = { version = "44" }
 datafusion-sql = { version = "44" }
 
+
 # serde
 serde = { version = "1.0.194", features = ["derive"] }
 serde_json = "1"
-strum = { version = "*"}
+strum = { version = "*" }
 
 
 # "stdlib"
@@ -78,3 +79,17 @@ futures = { version = "0.3" }
 tokio = { version = "1" }
 num_cpus = { version = "1" }
 
+# patch datafusion
+
+[patch.crates-io]
+# datafusion https://github.com/kosiew/datafusion branch tag-44
+datafusion = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-expr = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-common = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-ffi = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-functions = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-functions-aggregate = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-physical-expr = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-physical-plan = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-proto = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
+datafusion-sql = { git = "https://github.com/kosiew/datafusion", branch = "tag-44" }
